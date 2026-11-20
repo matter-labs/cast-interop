@@ -98,7 +98,7 @@ pub fn event_topic(signature: &str) -> B256 {
 
 pub fn interop_bundle_sent_topic() -> B256 {
     event_topic(
-        "InteropBundleSent(bytes32,bytes32,(bytes1,uint256,uint256,bytes32,(bytes1,bool,address,address,uint256,bytes)[],(bytes,bytes)))",
+        "InteropBundleSent(bytes32,bytes32,(bytes1,uint256,uint256,bytes32,(bytes1,bool,address,address,uint256,bytes)[],(bytes,bytes,bool)))",
     )
 }
 
@@ -247,6 +247,7 @@ pub fn bundle_view(bundle: &InteropBundle) -> BundleView {
         bundle_attributes: BundleAttributesView {
             execution_address: format_hex(bundle.bundleAttributes.executionAddress.as_ref()),
             unbundler_address: format_hex(bundle.bundleAttributes.unbundlerAddress.as_ref()),
+            use_fixed_fee: bundle.bundleAttributes.useFixedFee,
         },
     }
 }
@@ -370,4 +371,50 @@ pub fn decode_call_status(data: Bytes) -> Result<u8> {
 pub fn decode_bytes32(data: Bytes) -> Result<B256> {
     let value: (B256,) = <(B256,)>::abi_decode(&data)?;
     Ok(value.0)
+}
+
+/// A bundle extracted from a transaction receipt with its computed msg_index.
+#[derive(Clone)]
+#[allow(dead_code)]
+pub struct DetectedBundle {
+    pub msg_hash: B256,
+    pub bundle_hash: B256,
+    pub bundle: InteropBundle,
+    /// The L1MessageSent index for proof lookup (matches `zks_getL2ToL1LogProof` msg_index).
+    pub msg_index: u32,
+}
+
+/// Extract all `InteropBundleSent` events from a receipt, computing the correct
+/// `msg_index` for each based on L1MessageSent event ordering.
+///
+/// This mirrors the logic in `auto_relay::detect_jobs_from_receipt`.
+pub fn extract_bundles_from_receipt(
+    receipt: &alloy_rpc_types::TransactionReceipt,
+) -> Result<Vec<DetectedBundle>> {
+    let mut bundles = Vec::new();
+    let mut l1_message_count: u32 = 0;
+    let l1_messenger = crate::types::L1_SENDER_ADDRESS;
+    let l1_msg_topic = l1_message_sent_topic();
+    let bundle_topic = interop_bundle_sent_topic();
+
+    for log in receipt.logs() {
+        let topic = log.topics().first().copied();
+
+        if log.address() == l1_messenger && topic == Some(l1_msg_topic) {
+            l1_message_count += 1;
+        }
+
+        if topic == Some(bundle_topic) {
+            let (msg_hash, bundle_hash, bundle) =
+                decode_interop_bundle_sent(log.data().data.clone())?;
+            let msg_index = l1_message_count.saturating_sub(1);
+            bundles.push(DetectedBundle {
+                msg_hash,
+                bundle_hash,
+                bundle,
+                msg_index,
+            });
+        }
+    }
+    Ok(bundles)
 }
